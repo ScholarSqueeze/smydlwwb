@@ -6,7 +6,7 @@
 ## Стек
 - Python 3.11+, asyncio
 - **aiosteampy** ≥ 0.7 — Steam API (login, inventory, listings, orders, history, trade offers)
-- **aiohttp** + **httpx** (для CSFloat)
+- **aiohttp** (HTTP-клиент)
 - **SQLite** (через stdlib sqlite3) — локальный кеш
 - **protobuf** ≥ 5.26 — CS2 asset properties
 - **python-dotenv** — env-переменные
@@ -17,7 +17,9 @@
 ```
 simple.py           — главный скрипт: CLI-меню, логин, sweep, все команды
 cache.py            — SQLite-кеш: аккаунты, балансы, листинги, ордера, инвентарь, история
-item_info.py        — просмотр предмета: histogram, price_history, ASCII-график, листинги с флоатами
+item_info.py        — просмотр предмета: histogram, price_history, ASCII-график,
+                       листинги (Steam Market v2 POST API: float/seed в ответе,
+                       фильтры wear/seed/quality/exterior — серверные)
 patterns.py         — детектор редких паттернов CS2 (7patterns.txt / 7patterns.json)
 steam_errors.py     — классификатор ошибок Steam → SteamError(category, short, fatal_for_batch)
 
@@ -66,6 +68,8 @@ get_buy_orders_total(username) -> dict | None
 get_known_event_ids(username) -> set[str]
 get_cached_nameid(app_id, market_hash_name) -> int | None
 cache_nameid(app_id, market_hash_name, item_nameid)
+get_cached_gid(app_id, market_hash_name) -> str | None
+cache_gid(app_id, market_hash_name, gid)
 ```
 
 ### SQLite таблицы
@@ -76,6 +80,7 @@ cache_nameid(app_id, market_hash_name, item_nameid)
 - `market_history` (username+event_id PK, event_type, market_hash_name, time_event, price_cents) — append-only
 - `inventory_cache` (username+app_context+asset_id PK, market_hash_name, amount, paint_seed, paint_wear, state, tradable_after, extra_json, **hidden_from_public** INTEGER, **last_public_check_at** TEXT)
 - `market_nameids` (app_id+market_hash_name PK, item_nameid)
+- `market_gids` (app_id+market_hash_name PK, gid) — новый Steam Market 2026: GID = базовый ид скина
 - `refresh_log` (username+resource PK, last_refresh_at)
 
 ### inventory_cache.state
@@ -114,6 +119,14 @@ format_for_log(err, prefix="") -> str
 ```python
 await show_item_info_menu(client, market_hash_name, app, currency_enum, currency_code, ask=None, currency_sym="")
 await resolve_item_nameid(client, app_id, market_hash_name) -> int | None
+await resolve_gid(client, app_id, market_hash_name) -> str | None
+  # Новый Steam Market 2026: GID вида G[0-9A-Fa-f]+ вместо market_hash_name­в-URL'е.
+await _fetch_listings_page(session, app_id, gid, *, start, sort_field=0, sort_dir=1,
+                            category_filters=None, wear_range=None, seed_range=None,
+                            price_range=None, text_query=None, currency_code=None)
+  # POST /market/listings/<app>/<gid>; все фильтры серверные.
+  # Ответ (пропускаем через _parse_listings_v2) уже включает float (propertyid=2),
+  # paint_seed (propertyid=1) и d-value (propertyid=6) для inspect-URL.
 render_histogram_block / render_price_chart_block / render_sales_volume_block
 render_data_table / render_full_stack_block / render_listings_page
 ```
@@ -226,7 +239,7 @@ await _paginate_lazy(total, page_size, fetch_more, render, extra_commands)
 ## Конфигурация
 ```python
 STEAM_PASSWORD / MAFILE_PATH / FORCE_RELOGIN
-INVENTORY_PAGE_SIZE=25 / HISTORY_PAGE_SIZE=10 / LISTINGS_PAGE_SIZE=10
+INVENTORY_PAGE_SIZE=25 / HISTORY_PAGE_SIZE=10 / LISTINGS_PAGE_SIZE=20 (фиксирован Steam'ом)
 BUY_ORDER_LIMIT_MULTIPLIER=10
 
 # Env:
@@ -241,7 +254,7 @@ SWEEP_PROXY / SWEEP_PROXY_FILE
 2. **Троттлинг**: 0.3–0.4с между place_sell, 0.5с между аккаунтами в sweep, 4-8с (random) при сборе листингов
 3. **429 retry**: `_with_retry` — 3 попытки, задержки 3/8/20с
 4. **listed_asset_ids**: Steam оставляет предмет в инвентаре после выставления — cross-ref по unowned_id
-5. **CSFloat**: ~30 req/min, пауза 2с, httpx предпочтительнее aiohttp (TLS fingerprint)
+5. **Steam Market v2 (2026)**: float/paint_seed приходят в ответе POST `/market/listings/<app>/<GID>` — CSFloat убран, page size зашит у Steam'а в 20 шт., фильтры все серверные
 6. **Public inventory diff**: чистая сессия БЕЗ кук залогиненного акка — иначе Steam 401/403
 7. **_place_sell_listing_with_retry**: при confirm-сбое → cancel pending → перевыставляет 1 раз
 8. **Авто-трейд**: items_to_give=[] — строгая проверка, иначе пропуск

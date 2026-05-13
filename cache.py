@@ -127,6 +127,19 @@ CREATE TABLE IF NOT EXISTS market_nameids (
     fetched_at          TEXT,
     PRIMARY KEY (app_id, market_hash_name)
 );
+
+-- Маппинг (app_id, market_hash_name) → GID нового Steam Market 2026.
+-- GID — базовый идентификатор скина (без учёта wear/StatTrak/
+-- Souvenir): один GID группирует все экстерьеры/варианты. Получаем
+-- 301-редиректом со старого URL /market/listings/<app>/<name>;
+-- кешируем — GID стабилен.
+CREATE TABLE IF NOT EXISTS market_gids (
+    app_id              INTEGER NOT NULL,
+    market_hash_name    TEXT    NOT NULL,
+    gid                 TEXT    NOT NULL,
+    fetched_at          TEXT,
+    PRIMARY KEY (app_id, market_hash_name)
+);
 """
 
 
@@ -866,6 +879,31 @@ def cache_nameid(app_id: int, market_hash_name: str, item_nameid: int) -> None:
             "(app_id, market_hash_name, item_nameid, fetched_at) "
             "VALUES (?, ?, ?, ?)",
             (int(app_id), market_hash_name, int(item_nameid), _now_iso()),
+        )
+        conn.commit()
+
+
+def get_cached_gid(app_id: int, market_hash_name: str) -> str | None:
+    """Возвращает GID (новый ид Steam Market 2026) из кеша, либо None."""
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT gid FROM market_gids "
+            "WHERE app_id=? AND market_hash_name=?",
+            (int(app_id), market_hash_name),
+        ).fetchone()
+    return str(row[0]) if row else None
+
+
+def cache_gid(app_id: int, market_hash_name: str, gid: str) -> None:
+    """Кеширует (app_id, market_hash_name) → GID."""
+    if not gid:
+        return
+    with _db() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO market_gids "
+            "(app_id, market_hash_name, gid, fetched_at) "
+            "VALUES (?, ?, ?, ?)",
+            (int(app_id), market_hash_name, str(gid), _now_iso()),
         )
         conn.commit()
 

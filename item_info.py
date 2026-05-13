@@ -1,13 +1,17 @@
 # -*- coding: utf-8 -*-
 """Просмотр листингов и графика цены предмета на Steam Market.
 
-Делает 2 запроса к Steam:
+Делает два вызова aiosteampy:
 - `client.get_item_orders_histogram(item_nameid)` — топ buy- и sell-таблицы;
 - `client.fetch_price_history(market_hash_name, app)` — список точек
   «дата → средняя цена → объём».
+Плюс свой запрос листингов через новый POST-эндпоинт Steam
+(SSR-redesign 2026), который отдаёт float/paint_seed прямо в ответе.
 
 `item_nameid` (внутренний числовой ID Steam) НЕ совпадает с market_hash_name.
 Получаем его одноразовым fetch'ем HTML-страницы предмета и кешируем в SQLite.
+GID («базовый» ид скина в новом URL'е /market/listings/<app>/<gid>) резолвим
+с этой же страницы редиректом — тоже кешируем.
 
 Использование (как минимум):
     from item_info import show_item_info_menu
@@ -17,6 +21,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import urllib.parse
 from dataclasses import dataclass
@@ -30,27 +35,30 @@ import aiohttp
 # Резолвинг item_nameid (одноразовый запрос + кеш)
 # =============================================================================
 _NAMEID_RE = re.compile(r"Market_LoadOrderSpread\(\s*(\d+)\s*\)")
+_GID_RE = re.compile(r"/market/listings/\d+/(G[0-9A-Fa-f]+)")
 
 
-async def _fetch_nameid_from_steam(
+async def _fetch_item_page(
     session: aiohttp.ClientSession, app_id: int, market_hash_name: str
-) -> int | None:
-    """Скачивает страницу `/market/listings/{app_id}/{name}` и достаёт `item_nameid`.
+) -> tuple[str, str] | None:
+    """Скачивает страницу `/market/listings/{app_id}/{name}` Steam'а.
 
-    Возвращает None если страница вернулась 404 / без id в HTML.
+    Возвращает (final_url, html) либо None. final_url важен, потому
+    что Steam в новом дизайне делает 301 со старого URL'а на новый
+    `/market/listings/{app_id}/G<HEX>` — и оттуда мы вытащиваем GID.
     """
     url = (
         f"https://steamcommunity.com/market/listings/{app_id}/"
         + urllib.parse.quote(market_hash_name, safe="")
     )
-    async with session.get(url, headers={"Accept-Language": "en-US,en;q=0.9"}) as resp:
+    async with session.get(
+        url, headers={"Accept-Language": "en-US,en;q=0.9"},
+    ) as resp:
         if resp.status != 200:
             return None
         html = await resp.text()
-    match = _NAMEID_RE.search(html)
-    if not match:
-        return None
-    return int(match.group(1))
+        final_url = str(resp.url)
+    return (final_url, html)
 
 
 async def resolve_item_nameid(
@@ -59,7 +67,9 @@ async def resolve_item_nameid(
     """Возвращает item_nameid с использованием SQLite-кеша.
 
     Идёт по порядку: 1) cache.sqlite3 → 2) Steam HTML → 3) None.
-    Если Steam HTML отдал id — пишем в кеш для следующих запусков.
+    Если Steam HTML отдал id — пишем в кеш для следующих запусков. Параллельно
+    из этой же страницы вытаскиваем и GID (если его ещё нет в кеше) — экономим
+    один HTTP-запрос.
     """
     try:
         import cache
@@ -71,9 +81,25 @@ async def resolve_item_nameid(
         # Кеш — не критично, продолжаем с сетью.
         pass
 
-    nameid = await _fetch_nameid_from_steam(client.session, app_id, market_hash_name)
-    if nameid is None:
+    page = await _fetch_item_page(client.session, app_id, market_hash_name)
+    if page is None:
         return None
+    final_url, html = page
+
+    # GID — попутно попробуем положить в кеш, раз уж HTML уже выкачали.
+    gid_match = _GID_RE.search(final_url) or _GID_RE.search(html)
+    if gid_match:
+        try:
+            import cache
+
+            cache.cache_gid(app_id, market_hash_name, gid_match.group(1))
+        except Exception:  # noqa: BLE001
+            pass
+
+    name_match = _NAMEID_RE.search(html)
+    if not name_match:
+        return None
+    nameid = int(name_match.group(1))
 
     try:
         import cache
@@ -82,6 +108,45 @@ async def resolve_item_nameid(
     except Exception:  # noqa: BLE001
         pass
     return nameid
+
+
+async def resolve_gid(
+    client, app_id: int, market_hash_name: str
+) -> str | None:
+    """Резолвит (app_id, market_hash_name) -> GID нового Steam Market 2026.
+
+    GID — базовый ид скина (вида `G[0-9A-Fa-f]+`); один GID группирует все
+    экстерьеры/StatTrak/Souvenir-варианты предмета. Получаем редиректом
+    со старого URL `/market/listings/<app>/<market_hash_name>` (Steam отвечает
+    301 на новый идентификатор).
+
+    Порядок: 1) cache.sqlite3 → 2) Steam HTML → 3) None.
+    """
+    try:
+        import cache
+
+        cached = cache.get_cached_gid(app_id, market_hash_name)
+        if cached:
+            return cached
+    except Exception:  # noqa: BLE001
+        pass
+
+    page = await _fetch_item_page(client.session, app_id, market_hash_name)
+    if page is None:
+        return None
+    final_url, html = page
+    match = _GID_RE.search(final_url) or _GID_RE.search(html)
+    if not match:
+        return None
+    gid = match.group(1)
+
+    try:
+        import cache
+
+        cache.cache_gid(app_id, market_hash_name, gid)
+    except Exception:  # noqa: BLE001
+        pass
+    return gid
 
 
 # =============================================================================
@@ -536,261 +601,202 @@ def render_full_stack_block(
 
 
 # =============================================================================
-# Floats viewer (выставленные листинги с inspect-link'ами и опц. флоатами)
+# Listings viewer (POST /market/listings/<app>/<GID> — Steam Market 2026 v2)
 # =============================================================================
-_INSPECT_M_RE = re.compile(r"\+csgo_econ_action_preview%20(M\d+A\d+D\d+)")
-_INSPECT_S_RE = re.compile(r"\+csgo_econ_action_preview%20(S\d+A\d+D\d+)")
-_FLOAT_VALUE_RE = re.compile(r"\"floatvalue\"\s*:\s*([0-9.]+)")
-_PAINT_SEED_RE = re.compile(r"\"paintseed\"\s*:\s*(\d+)")
+# Старый GET `/render/`-эндпоинт убран Steam'ом 2025-11. Теперь это POST
+# на тот же URL (с GID вместо market_hash_name), тело — JSON-массив с одним
+# объектом {appid, strItemName, sort, filters, propertyFilters, start}, ответ
+# уже содержит float (propertyid=2) и paint_seed (propertyid=1) — CSFloat
+# больше не нужен. Полная спецификация в reports/steam_market_v2_api.md.
+
+# Page size зашит у Steam'а в 20 — увеличить нельзя (отбивает 400). Если
+# нужно больше — пагинируем через start += LISTINGS_PAGE_SIZE.
+LISTINGS_PAGE_SIZE = 20
+
+# Заголовки маркета 2026 — без них Steam отвечает 400 «Invalid action type».
+# Action token "4OPT6VBA:Search" — стабильный route-hash для POST /listings/.
+_MARKET_HEADERS = {
+    "Content-Type": "application/json; charset=utf-8",
+    "X-Valve-Action-Type": "4OPT6VBA:Search",
+    "X-Valve-Request-Type": "routeAction",
+    "Accept": "*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+# CS2 categorical-фильтры (левая панель UI на listings-странице).
+# Ключи попадают в JSON-тело как `filters`, значения — массив тэгов (OR).
+# Полный список тэгов берётся из `facets` ответа, но эти — стабильные.
+EXTERIOR_TAGS = {
+    "fn": "tag_WearCategory0",  # Factory New
+    "mw": "tag_WearCategory1",  # Minimal Wear
+    "ft": "tag_WearCategory2",  # Field-Tested
+    "ww": "tag_WearCategory3",  # Well-Worn
+    "bs": "tag_WearCategory4",  # Battle-Scarred
+}
+QUALITY_TAGS = {
+    "normal": "tag_normal",       # обычный (без StatTrak/Souvenir)
+    "stattrak": "tag_strange",    # StatTrak™
+    "st": "tag_strange",
+    "souvenir": "tag_tournament", # Souvenir
+    "sv": "tag_tournament",
+}
 
 
-async def _fetch_listings_page(
+async def _fetch_listings_page(  # noqa: PLR0913
     session: aiohttp.ClientSession,
     app_id: int,
-    market_hash_name: str,
+    gid: str,
     *,
     start: int,
-    count: int,
-    currency_code: int,
+    sort_field: int = 0,
+    sort_dir: int = 1,
+    category_filters: dict[str, list[str]] | None = None,
+    wear_range: tuple[float, float] | None = None,
+    seed_range: tuple[int, int] | None = None,
+    price_range: tuple[int, int] | None = None,
+    text_query: str | None = None,
+    currency_code: int | None = None,
 ) -> dict | None:
-    """Скачивает страницу `/market/listings/{app_id}/{name}/render`.
+    """POST `/market/listings/{app_id}/{GID}` — новый Steam Market 2026 API.
 
-    Возвращает разобранный JSON-словарь Steam'а либо None при ошибке.
+    Возвращает разобранный JSON (с ключами `listings`, `total_count`, `more`,
+    `facets`) либо None при ошибке.
+
+    Параметры
+    ---------
+    sort_field=0, sort_dir=0|1 — сортировка по цене (других режимов нет).
+    category_filters — {"category_730_Quality": ["tag_normal"], …}.
+        Ключи: category_730_{Exterior,Quality,Type,Rarity,Weapon,
+        Tournament,TournamentTeam,ProPlayer,ItemSet,Sticker,Charm}.
+        Значения — массив тэгов (OR). Полный список в `facets` ответа.
+    wear_range=(0.15, 0.20) — диапазон флоата (propertyid=2).
+    seed_range=(100, 200) — диапазон paint seed (propertyid=1).
+        ! Steam хочет именно строки в int_min/int_max — иначе вернёт листинги
+        с seed=0. Преобразуем здесь автоматически.
+    price_range=(unMin_cents, unMax_cents) — цены в центах, включительные.
+    text_query — полнотекстовый поиск по market_hash_name.
+    currency_code — eCurrency. Если None, Steam возьмёт из cookies сессии.
     """
     url = (
         f"https://steamcommunity.com/market/listings/{app_id}/"
-        + urllib.parse.quote(market_hash_name, safe="")
-        + "/render/"
+        + urllib.parse.quote(gid, safe="")
     )
-    params = {
-        "query": "",
-        "start": str(start),
-        "count": str(count),
-        "country": "US",
-        "language": "english",
-        "currency": str(currency_code),
+
+    property_filters: dict[str, dict] = {}
+    if seed_range is not None:
+        lo, hi = seed_range
+        property_filters["1"] = {
+            "property_id": 1,
+            "int_min": str(int(lo)),
+            "int_max": str(int(hi)),
+        }
+    if wear_range is not None:
+        lo, hi = wear_range
+        property_filters["2"] = {
+            "property_id": 2,
+            "float_min": float(lo),
+            "float_max": float(hi),
+        }
+
+    body_obj: dict[str, Any] = {
+        "appid": int(app_id),
+        "strItemName": gid,
+        "sort": {"field": int(sort_field), "direction": int(sort_dir)},
+        "filters": category_filters or {},
+        "accessoryFilters": {},
+        "propertyFilters": property_filters,
+        "start": int(start),
     }
-    async with session.get(url, params=params,
-                            headers={"Accept-Language": "en-US,en;q=0.9"}) as resp:
-        if resp.status != 200:
-            return None
-        try:
-            return await resp.json(content_type=None)
-        except Exception:  # noqa: BLE001
-            return None
+    if price_range is not None:
+        body_obj["price"] = {
+            "eCurrency": int(currency_code or 1),
+            "unMin": int(price_range[0]),
+            "unMax": int(price_range[1]),
+        }
+    if text_query:
+        body_obj["strQuery"] = text_query
+
+    body = json.dumps([body_obj]).encode("utf-8")
+    try:
+        async with session.post(
+            url, data=body, headers=_MARKET_HEADERS,
+        ) as resp:
+            if resp.status != 200:
+                return None
+            try:
+                return await resp.json(content_type=None)
+            except Exception:  # noqa: BLE001
+                return None
+    except aiohttp.ClientError:
+        return None
 
 
-def _parse_listings_render(data: dict) -> list[dict]:
-    """Из ответа `/render/` достаёт список листингов.
+def _parse_listings_v2(data: dict) -> list[dict]:
+    """Из ответа нового POST-эндпоинта достаёт список листингов.
 
-    Каждый элемент: {listing_id, asset_id, price_cents, inspect_url}.
-    Внутри `listinginfo` ключ = listing_id; `asset.market_actions[0].link` —
-    шаблон ссылки `…M<listing_id>A<asset_id>D<dvalue>`. listing_id /
-    asset_id / d-value подставляются вместо плейсхолдеров %listingid% etc.
+    Каждый элемент: {listing_id, asset_id, price_cents, float, paint_seed,
+    inspect_url, market_hash_name}. Float и seed теперь приходят сразу — для
+    CS2 они лежат в `asset.asset_properties` (propertyid=1 → seed,
+    propertyid=2 → wear, propertyid=6 → d-value для inspect-URL).
     """
     out: list[dict] = []
-    listings = (data or {}).get("listinginfo") or {}
-    for listing_id, info in listings.items():
+    for li in (data or {}).get("listings") or []:
         try:
-            asset = info["asset"]
+            asset = li["asset"]
             asset_id = str(asset["id"])
-            # Steam отдаёт price в виде «converted_price_per_unit + converted_fee_per_unit».
-            # Если их нет — fallback на price (без комиссии).
-            if "converted_price_per_unit" in info:
-                price = int(info["converted_price_per_unit"])
-                fee = int(info.get("converted_fee_per_unit") or 0)
-                price_cents = price + fee
-            else:
-                price_cents = int(info.get("price") or 0)
-            actions = asset.get("market_actions") or []
+            listing_id = str(li["listingid"])
+            # Цена: unPricePerUnit + unFeePerUnit (оба в центах).
+            try:
+                price_cents = (
+                    int(li.get("unPricePerUnit") or 0)
+                    + int(li.get("unFeePerUnit") or 0)
+                )
+            except (TypeError, ValueError):
+                price_cents = 0
+
+            seed: int | None = None
+            wear: float | None = None
+            d_value: str | None = None
+            for prop in asset.get("asset_properties") or []:
+                pid = prop.get("propertyid")
+                if pid == 1 and "int_value" in prop:
+                    try:
+                        seed = int(prop["int_value"])
+                    except (TypeError, ValueError):
+                        pass
+                elif pid == 2 and "float_value" in prop:
+                    try:
+                        wear = float(prop["float_value"])
+                    except (TypeError, ValueError):
+                        pass
+                elif pid == 6 and "string_value" in prop:
+                    d_value = str(prop["string_value"])
+
+            descr = li.get("description") or {}
+            actions = descr.get("market_actions") or []
             inspect = ""
             if actions:
-                inspect_template = actions[0].get("link") or ""
-                inspect = (
-                    inspect_template
-                    .replace("%listingid%", listing_id)
-                    .replace("%assetid%", asset_id)
-                )
+                tpl = actions[0].get("link") or ""
+                if tpl and d_value:
+                    inspect = (
+                        tpl.replace("%propid:6%", d_value)
+                        # На случай legacy-шаблона %listingid%/%assetid%.
+                        .replace("%listingid%", listing_id)
+                        .replace("%assetid%", asset_id)
+                    )
+
             out.append({
                 "listing_id": listing_id,
                 "asset_id": asset_id,
                 "price_cents": price_cents,
+                "float": wear,
+                "paint_seed": seed,
                 "inspect_url": inspect,
+                "market_hash_name": descr.get("market_hash_name") or "",
             })
         except (KeyError, ValueError, TypeError):
             continue
     return out
-
-
-# api.csfloat.com часто отбивает «голые» запросы (без браузерных заголовков),
-# поэтому добавляем User-Agent + Referer + Origin как реальный браузер.
-_CSFLOAT_BASE_URL = "https://api.csfloat.com/"
-_CSFLOAT_HOST = "api.csfloat.com"
-
-# Кешируем результат DNS-резолва api.csfloat.com на время процесса:
-#   None — ещё не проверяли;
-#   True — резолв успешный, ходим;
-#   False — резолв упал (нет интернета / DNS у провайдера, нужна VPN).
-# После одного fail (None, None) возвращаем мгновенно — не насилуем сеть и
-# не ждём таймаут на каждый из 10/20/50 листингов (см. fix #8 из бэклога).
-_CSFLOAT_DNS_OK: bool | None = None
-
-
-async def _csfloat_dns_check() -> bool:
-    """True если api.csfloat.com резолвится; False если нет.
-
-    Прогоняется один раз за процесс — результат кешируется в `_CSFLOAT_DNS_OK`.
-    """
-    global _CSFLOAT_DNS_OK
-    if _CSFLOAT_DNS_OK is not None:
-        return _CSFLOAT_DNS_OK
-    import asyncio  # локально — не плодим top-level импорты
-    import socket
-    loop = asyncio.get_running_loop()
-    try:
-        await loop.getaddrinfo(_CSFLOAT_HOST, 443, proto=socket.IPPROTO_TCP)
-        _CSFLOAT_DNS_OK = True
-    except Exception as exc:  # noqa: BLE001
-        _CSFLOAT_DNS_OK = False
-        print(
-            f"   [!] api.csfloat.com — DNS-резолв упал: "
-            f"{type(exc).__name__}: {exc}\n"
-            "       Скорее всего, провайдер блокирует csfloat.com (нужна VPN) "
-            "или\n"
-            "       нет интернета. Флоаты в этой сессии резолвиться не будут —\n"
-            "       последующие запросы я не буду отправлять, чтобы не ждать\n"
-            "       таймаут на каждом листинге. Включи VPN и перезапусти скрипт."
-        )
-    return _CSFLOAT_DNS_OK
-_CSFLOAT_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36 Edg/141.0.0.0"
-    ),
-    "Accept": "application/json, text/plain, */*",
-    "DNT": "1",
-    "Referer": "https://csfloat.com/",
-    "Origin": "https://csfloat.com",
-}
-
-
-def _parse_csfloat_payload(data: Any) -> tuple[float | None, int | None]:
-    """Из JSON-ответа api.csfloat.com достаёт (floatvalue, paintseed).
-
-    Поддерживает оба формата: {"iteminfo": {...}} и старый flat-формат с
-    floatvalue/paintseed на верхнем уровне.
-    """
-    if not isinstance(data, dict):
-        return (None, None)
-    info = data.get("iteminfo") if isinstance(data.get("iteminfo"), dict) else data
-    fl_raw = info.get("floatvalue")
-    sd_raw = info.get("paintseed")
-    try:
-        fl = float(fl_raw) if fl_raw is not None else None
-    except (TypeError, ValueError):
-        fl = None
-    try:
-        sd = int(sd_raw) if sd_raw is not None else None
-    except (TypeError, ValueError):
-        sd = None
-    return (fl, sd)
-
-
-async def _resolve_float_via_csfloat(
-    session: aiohttp.ClientSession, inspect_url: str,
-    *,
-    proxy: str | None = None,
-) -> tuple[float | None, int | None]:
-    """Запрашивает api.csfloat.com и возвращает (float, seed).
-
-    Сначала пытается через `httpx.AsyncClient` (api.csfloat при таком TLS
-    fingerprint отвечает охотнее, чем у aiohttp). Если `httpx` не установлен —
-    fallback на aiohttp с теми же браузерными заголовками. На ошибки/таймауты
-    возвращает (None, None).
-
-    Бесплатный публичный endpoint, rate-limit ~30 req/min — троттлинг задаёт
-    вызывающий (`_show_listings_with_floats` спит 2с между запросами).
-    """
-    if not inspect_url:
-        return (None, None)
-
-    # 0) DNS pre-flight. Если api.csfloat.com не резолвится — выходим сразу.
-    # Без этой проверки каждый из 10/20/50 листингов будет ждать таймаут
-    # httpx.ConnectError → aiohttp.ClientConnectorDNSError, что подвешивает
-    # UI на минуту-другую. Один раз за процесс пробуем DNS — потом кеш.
-    if not await _csfloat_dns_check():
-        return (None, None)
-
-    # 1) httpx (предпочтительный путь, как предложено).
-    try:
-        import httpx  # noqa: PLC0415  (лазовый импорт — не у всех установлен)
-    except ImportError:
-        httpx = None  # type: ignore[assignment]
-
-    if httpx is not None:
-        try:
-            httpx_kwargs: dict = dict(
-                base_url=_CSFLOAT_BASE_URL,
-                headers=_CSFLOAT_HEADERS,
-                timeout=15.0,
-            )
-            if proxy:
-                # httpx >=0.28 принимает `proxy="http://..."`; старые версии — `proxies=`.
-                try:
-                    async with httpx.AsyncClient(
-                        proxy=proxy, **httpx_kwargs
-                    ) as client:
-                        resp = await client.get("/", params={"url": inspect_url})
-                except TypeError:
-                    async with httpx.AsyncClient(
-                        proxies=proxy, **httpx_kwargs
-                    ) as client:
-                        resp = await client.get("/", params={"url": inspect_url})
-            else:
-                async with httpx.AsyncClient(**httpx_kwargs) as client:
-                    resp = await client.get("/", params={"url": inspect_url})
-            if resp.status_code == 200:
-                try:
-                    return _parse_csfloat_payload(resp.json())
-                except ValueError:
-                    # json() ругнётся если ответ не JSON — fallback на regex по тексту.
-                    text = resp.text
-                    fl_m = _FLOAT_VALUE_RE.search(text)
-                    sd_m = _PAINT_SEED_RE.search(text)
-                    fl = float(fl_m.group(1)) if fl_m else None
-                    sd = int(sd_m.group(1)) if sd_m else None
-                    return (fl, sd)
-        except Exception:  # noqa: BLE001
-            # На любую ошибку httpx — попробуем aiohttp ниже.
-            pass
-
-    # 2) Fallback: aiohttp с теми же заголовками.
-    aiohttp_kwargs: dict = dict(
-        params={"url": inspect_url},
-        headers=_CSFLOAT_HEADERS,
-        timeout=aiohttp.ClientTimeout(total=15),
-    )
-    if proxy:
-        aiohttp_kwargs["proxy"] = proxy
-    try:
-        async with session.get(
-            _CSFLOAT_BASE_URL,
-            **aiohttp_kwargs,
-        ) as resp:
-            if resp.status != 200:
-                return (None, None)
-            try:
-                data = await resp.json(content_type=None)
-                return _parse_csfloat_payload(data)
-            except Exception:  # noqa: BLE001
-                text = await resp.text()
-                fl_m = _FLOAT_VALUE_RE.search(text)
-                sd_m = _PAINT_SEED_RE.search(text)
-                fl = float(fl_m.group(1)) if fl_m else None
-                sd = int(sd_m.group(1)) if sd_m else None
-                return (fl, sd)
-    except Exception:  # noqa: BLE001
-        return (None, None)
 
 
 def render_listings_page(
@@ -799,11 +805,13 @@ def render_listings_page(
     sym: str,
     start_idx: int,
     total: int,
-    floats: dict[str, tuple[float | None, int | None]] | None = None,
+    floats: dict[str, tuple[float | None, int | None]] | None = None,  # noqa: ARG001
 ) -> list[str]:
     """Рисует страницу листингов.
 
-    floats: dict listing_id → (float, seed). Если есть — печатаем колонку флоата.
+    Float/seed теперь приходят прямо в листинге из Steam Market v2 — рисуем
+    их всегда (если у предмета их нет, печатаем «—»). Параметр `floats`
+    оставлен для обратной совместимости вызывающего кода, но игнорируется.
     """
     lines = []
     lines.append("=" * 88)
@@ -811,34 +819,21 @@ def render_listings_page(
         f"   Листинги ({start_idx + 1}..{start_idx + len(listings)} из {total})"
     )
     lines.append("=" * 88)
-    has_floats = bool(floats)
-    if has_floats:
-        lines.append(
-            f"   {'#':<4}{'Цена':<14}{'Float':<10}{'Seed':<7}{'listing_id':<22}asset_id"
-        )
-    else:
-        lines.append(
-            f"   {'#':<4}{'Цена':<14}{'listing_id':<22}{'asset_id':<20}inspect"
-        )
+    lines.append(
+        f"   {'#':<4}{'Цена':<14}{'Float':<10}{'Seed':<7}"
+        f"{'listing_id':<22}asset_id"
+    )
     lines.append("-" * 88)
     for i, item in enumerate(listings, start_idx + 1):
         price_str = f"{item['price_cents'] / 100:.2f} {sym}"
-        if has_floats:
-            fl, sd = (floats or {}).get(item["listing_id"], (None, None))
-            fl_str = f"{fl:.4f}" if fl is not None else "—"
-            sd_str = str(sd) if sd is not None else "—"
-            lines.append(
-                f"   {i:<4}{price_str:<14}{fl_str:<10}{sd_str:<7}"
-                f"{item['listing_id']:<22}{item['asset_id']}"
-            )
-        else:
-            inspect_short = item["inspect_url"][:40] + "..." if (
-                len(item["inspect_url"]) > 40
-            ) else item["inspect_url"]
-            lines.append(
-                f"   {i:<4}{price_str:<14}{item['listing_id']:<22}"
-                f"{item['asset_id']:<20}{inspect_short}"
-            )
+        fl = item.get("float")
+        sd = item.get("paint_seed")
+        fl_str = f"{fl:.4f}" if isinstance(fl, (int, float)) else "—"
+        sd_str = str(sd) if isinstance(sd, int) else "—"
+        lines.append(
+            f"   {i:<4}{price_str:<14}{fl_str:<10}{sd_str:<7}"
+            f"{item['listing_id']:<22}{item['asset_id']}"
+        )
     lines.append("-" * 88)
     return lines
 
@@ -995,179 +990,263 @@ async def _show_listings_with_floats(  # noqa: PLR0912, PLR0915, C901
     client, app_id: int, market_hash_name: str, currency_code: int,
     sym: str, ask,
     *,
-    page_size: int = 10,
+    page_size: int = LISTINGS_PAGE_SIZE,  # noqa: ARG001  (фиксированный размер)
 ) -> None:
-    """Просмотр выставленных листингов: цена + inspect-URL + (опц.) флоат.
+    """Просмотр выставленных листингов: цена + float + paint_seed + inspect-URL.
 
-    `page_size` — сколько грузить за раз (1..100). Steam ограничивает count<=100.
+    Все фильтры серверные — Steam Market v2 возвращает float/seed сразу в ответе
+    и умеет ограничивать выдачу по любому из них. CSFloat больше не нужен.
 
     Команды внутри:
-        h / help          — показать подробную справку
-        n / Enter         — следующая страница
-        p                 — предыдущая
-        resolve / r       — попытаться вытащить флоаты через api.csfloat.com
-                            (медленно: ~30 req/min — может уйти 1-3 мин)
-        flt 0.2           — фильтр: показывать только листинги с float<0.2
-                            (нужно сначала загрузить флоаты через resolve)
-        flt off / reset   — сбросить фильтр
-        q / Enter (пустой) — выход
+        h / help            — показать подробную справку
+        n / Enter           — следующая страница
+        p                   — предыдущая
+        flt 0.15 0.20       — фильтр по флоату (диапазон)
+        flt off             — сбросить фильтр по флоату
+        seed 100 200        — фильтр по paint seed
+        seed 661            — точный seed
+        seed off            — сбросить
+        q normal/st/sv      — фильтр по качеству (Normal / StatTrak™ / Souvenir)
+        q off               — сбросить
+        ext fn/mw/ft/ww/bs  — фильтр по экстерьеру (можно через запятую: ext ft,mw)
+        ext off             — сбросить
+        clear               — сбросить все фильтры
+        q / Enter (пустой)  — выход
     """
-    print(f"\n=== ЛИСТИНГИ С ФЛОАТАМИ: {market_hash_name} ===")
-    print(f"   Размер страницы: {page_size} шт. Steam max=100.")
-    print("   Введи 'h' чтобы увидеть все команды.")
+    # Page size зашит у Steam — игнорируем параметр (оставлен для backward-compat).
+    eff_page = LISTINGS_PAGE_SIZE
+
+    print(f"\n=== ЛИСТИНГИ: {market_hash_name} ===")
+    print("   [..] Резолвлю GID …")
+    gid = await resolve_gid(client, app_id, market_hash_name)
+    if not gid:
+        print("   [ERR] Не смог получить GID — Steam не вернул новый id-страницу.")
+        return
+    print(f"   GID = {gid}.  Размер страницы: {eff_page} (Steam-fixed).")
+    print("   float/seed приходят сразу — CSFloat не нужен.")
+    print("   Введи 'h' для справки.")
 
     start = 0
     page_listings: list[dict] = []
-    page_floats: dict[str, tuple[float | None, int | None]] = {}
     total = 0
-    min_float_filter: float | None = None
-    loaded_start: int | None = None
+    loaded_key: tuple | None = None  # ключ кеша = (start, фильтры)
+
+    # Состояние фильтров.
+    wear_range: tuple[float, float] | None = None
+    seed_range: tuple[int, int] | None = None
+    quality_tags: list[str] = []
+    exterior_tags: list[str] = []
+
+    def _category_filters() -> dict[str, list[str]]:
+        f: dict[str, list[str]] = {}
+        if exterior_tags:
+            f["category_730_Exterior"] = list(exterior_tags)
+        if quality_tags:
+            f["category_730_Quality"] = list(quality_tags)
+        return f
+
+    def _filter_summary() -> str:
+        bits: list[str] = []
+        if wear_range:
+            bits.append(f"flt={wear_range[0]:.4f}..{wear_range[1]:.4f}")
+        if seed_range:
+            bits.append(
+                f"seed={seed_range[0]}"
+                if seed_range[0] == seed_range[1]
+                else f"seed={seed_range[0]}..{seed_range[1]}"
+            )
+        if quality_tags:
+            human = {v: k for k, v in QUALITY_TAGS.items()}
+            bits.append("q=" + ",".join(human.get(t, t) for t in quality_tags))
+        if exterior_tags:
+            human = {v: k for k, v in EXTERIOR_TAGS.items()}
+            bits.append("ext=" + ",".join(human.get(t, t) for t in exterior_tags))
+        return " | ".join(bits) if bits else "—"
+
+    def _filter_key() -> tuple:
+        return (
+            wear_range,
+            seed_range,
+            tuple(quality_tags),
+            tuple(exterior_tags),
+        )
 
     def _help():
         print(
             "\n  СПРАВКА:\n"
-            "    n         — следующая страница (start += page_size)\n"
-            "    p         — предыдущая\n"
-            "    resolve   — попытаться вытащить флоаты для текущей страницы\n"
-            "                через api.csfloat.com. Бесплатный публичный inspector\n"
-            "                ~30 запросов/мин (по 2с между запросами).\n"
-            "                Если у тебя нет интернета до csfloat — флоаты\n"
-            "                покажутся как «—».\n"
-            "    flt 0.2   — фильтр: показывать только листинги с float<0.2.\n"
-            "                Требует, чтобы флоаты были загружены через 'resolve'.\n"
-            "    flt off   — снять фильтр.\n"
-            "    q или Enter (пустой) — выход."
+            "    n / Enter            — следующая страница\n"
+            "    p                    — предыдущая\n"
+            "    flt 0.15 0.20        — фильтр по флоату (диапазон)\n"
+            "    flt off              — сбросить фильтр по флоату\n"
+            "    seed 100 200         — фильтр по paint seed\n"
+            "    seed 661             — точное значение\n"
+            "    seed off             — сбросить\n"
+            "    q normal/st/sv       — качество (Normal / StatTrak™ / Souvenir);\n"
+            "                            можно через запятую: q st,normal\n"
+            "    q off                — сбросить\n"
+            "    ext fn/mw/ft/ww/bs   — экстерьер; можно через запятую: ext ft,mw\n"
+            "    ext off              — сбросить\n"
+            "    clear                — сбросить все фильтры\n"
+            "    q / Enter (пустой)   — выход"
         )
 
     while True:
-        # Если ещё не грузили текущую страницу — грузим.
-        if loaded_start != start:
-            print(f"\n[..] Гружу листинги: start={start} count={page_size} ...")
+        cur_key = (start, _filter_key())
+        if loaded_key != cur_key:
+            print(f"\n[..] Гружу листинги: start={start} ({_filter_summary()}) …")
             data = await _fetch_listings_page(
-                client.session, app_id, market_hash_name,
-                start=start, count=page_size, currency_code=currency_code,
+                client.session, app_id, gid,
+                start=start,
+                category_filters=_category_filters() or None,
+                wear_range=wear_range,
+                seed_range=seed_range,
+                currency_code=currency_code,
             )
             if data is None:
                 print("   [ERR] Не смог загрузить страницу листингов.")
                 return
             total = int(data.get("total_count") or 0)
-            page_listings = _parse_listings_render(data)
-            loaded_start = start
-            page_floats = {}  # сбрасываем кеш флоатов
+            page_listings = _parse_listings_v2(data)
+            loaded_key = cur_key
 
-        # Фильтр (только если флоаты есть).
-        listings_to_show = page_listings
-        if min_float_filter is not None and page_floats:
-            listings_to_show = [
-                lst for lst in page_listings
-                if page_floats.get(lst["listing_id"], (None, None))[0] is not None
-                and page_floats[lst["listing_id"]][0] < min_float_filter
-            ]
-
-        if not listings_to_show:
-            if page_listings and min_float_filter is not None:
-                print(f"\n(нет листингов с float<{min_float_filter} на этой странице)")
-            else:
-                print("\n(на этой странице нет листингов)")
+        if not page_listings:
+            print(
+                f"\n(на этой странице нет листингов; фильтры: {_filter_summary()})"
+            )
         else:
             for line in render_listings_page(
-                listings_to_show, sym=sym, start_idx=start, total=total,
-                floats=page_floats if page_floats else None,
+                page_listings, sym=sym, start_idx=start, total=total,
             ):
                 print(line)
 
-        page_num = start // page_size + 1
-        total_pages = max(1, (total + page_size - 1) // page_size)
+        page_num = start // eff_page + 1
+        total_pages = max(1, (total + eff_page - 1) // eff_page)
         cmd = (await ask(
-            f"  n=след / p=пред / resolve=флоаты / flt 0.X / h=справка / "
-            f"Enter=выход (стр. {page_num}/{total_pages}): "
+            f"  n=след / p=пред / flt X Y / seed A B / q normal|st|sv / "
+            f"ext fn|mw|ft|ww|bs / clear / h=справка / Enter=выход "
+            f"(стр. {page_num}/{total_pages}, фильтры: {_filter_summary()}): "
         )).strip().lower()
 
-        if cmd in ("", "q", "b", "exit", "quit"):
+        if cmd in ("", "exit", "quit"):
             return
         if cmd in ("h", "help", "?"):
             _help()
             continue
         if cmd in ("n", "next"):
-            new_start = start + page_size
+            new_start = start + eff_page
             if new_start >= total:
                 print("  (это последняя страница)")
                 continue
             start = new_start
         elif cmd in ("p", "prev"):
-            new_start = max(0, start - page_size)
+            new_start = max(0, start - eff_page)
             if new_start == start:
                 print("  (это первая страница)")
                 continue
             start = new_start
-        elif cmd in ("resolve", "r"):
-            n = len(page_listings)
-            import asyncio as _asyncio
-            # Опционально — прокси-пул из simple.py (round-robin + failover).
-            # Импортируем лениво чтобы не создавать circular import.
-            proxy_rot = None
-            try:
-                import simple as _simple  # type: ignore[import-not-found]
-                pool = _simple._load_proxy_pool()
-                if pool:
-                    use_p = (await ask(
-                        f"  Использовать прокси-пул ({len(pool)} шт.) для запросов "
-                        "csfloat? (y/N): "
-                    )).strip().lower()
-                    if use_p in ("y", "yes", "д", "да"):
-                        proxy_rot = _simple._ProxyRotator(pool)
-                        print(
-                            f"  [..] csfloat: round-robin через {len(pool)} прокси "
-                            "(rotate at каждом запросе, failover при ошибке)."
-                        )
-            except Exception:  # noqa: BLE001
-                proxy_rot = None
-            print(f"  [..] Резолвлю флоаты {n} листингов через api.csfloat.com ...")
-            print("       (rate-limit ~30 req/min, пауза 2с между; может уйти 1-3 мин)")
-            ok_count = 0
-            for i, lst in enumerate(page_listings, 1):
-                if not lst["inspect_url"]:
-                    page_floats[lst["listing_id"]] = (None, None)
-                    continue
-                current_proxy = proxy_rot.current() if proxy_rot else None
-                fl, sd = await _resolve_float_via_csfloat(
-                    client.session, lst["inspect_url"], proxy=current_proxy,
-                )
-                page_floats[lst["listing_id"]] = (fl, sd)
-                if fl is not None:
-                    ok_count += 1
-                    if proxy_rot:
-                        proxy_rot.advance()
-                else:
-                    # Не вышло — отметим прокси как bad (если есть).
-                    if proxy_rot:
-                        proxy_rot.mark_bad()
-                if i % 10 == 0 or i == n:
-                    print(f"       {i}/{n} ...", flush=True)
-                await _asyncio.sleep(2.0)
-            print(f"  [OK] Резолвлено {ok_count} из {n} (остальные — None).")
-            if ok_count == 0:
-                print("       [!] Не удалось получить ни одного флоата. "
-                      "Скорее всего csfloat.com недоступен / rate-limit'ит / "
-                      "прокси-пул умер.")
+        elif cmd == "clear":
+            wear_range = None
+            seed_range = None
+            quality_tags = []
+            exterior_tags = []
+            start = 0
+            print("  [filter] все фильтры сброшены.")
         elif cmd.startswith("flt"):
-            # «flt 0.2» — фильтр float<0.2; «flt off» — сбросить.
             arg = cmd[3:].strip()
             if arg in ("off", "reset", "", "none"):
-                min_float_filter = None
-                print("  [filter] сброшен.")
-            else:
-                try:
-                    thr = float(arg.replace(",", "."))
-                    if not 0.0 <= thr <= 1.0:
-                        print("  flt: значение должно быть 0..1.")
+                wear_range = None
+                start = 0
+                print("  [filter] flt сброшен.")
+                continue
+            parts = arg.replace(",", " ").split()
+            try:
+                if len(parts) == 1:
+                    hi = float(parts[0])
+                    lo = 0.0
+                elif len(parts) == 2:
+                    lo, hi = float(parts[0]), float(parts[1])
+                else:
+                    raise ValueError("ожидаю 1 или 2 числа")
+                if not (0.0 <= lo <= hi <= 1.0):
+                    print("  flt: 0 ≤ lo ≤ hi ≤ 1, попробуй ещё раз.")
+                    continue
+                wear_range = (lo, hi)
+                start = 0
+                print(f"  [filter] flt={lo:.4f}..{hi:.4f}")
+            except ValueError as exc:
+                print(f"  flt: не понял «{arg}» ({exc}). Пример: flt 0.15 0.20")
+        elif cmd.startswith("seed"):
+            arg = cmd[4:].strip()
+            if arg in ("off", "reset", "", "none"):
+                seed_range = None
+                start = 0
+                print("  [filter] seed сброшен.")
+                continue
+            parts = arg.replace(",", " ").split()
+            try:
+                if len(parts) == 1:
+                    v = int(parts[0])
+                    if not 0 <= v <= 1000:
+                        print("  seed: 0..1000.")
                         continue
-                    if not page_floats:
-                        print("  [!] Сначала загрузи флоаты командой 'resolve'.")
+                    seed_range = (v, v)
+                elif len(parts) == 2:
+                    lo, hi = int(parts[0]), int(parts[1])
+                    if not (0 <= lo <= hi <= 1000):
+                        print("  seed: 0 ≤ lo ≤ hi ≤ 1000.")
                         continue
-                    min_float_filter = thr
-                    print(f"  [filter] показываю только float<{thr}.")
-                except ValueError:
-                    print(f"  flt: «{arg}» — не число. Пример: flt 0.2")
+                    seed_range = (lo, hi)
+                else:
+                    raise ValueError("ожидаю 1 или 2 целых числа")
+                start = 0
+                print(f"  [filter] seed={seed_range[0]}..{seed_range[1]}")
+            except ValueError as exc:
+                print(f"  seed: не понял «{arg}» ({exc}). Пример: seed 100 200")
+        elif cmd.startswith("q "):
+            arg = cmd[2:].strip()
+            if arg in ("off", "reset", "", "none"):
+                quality_tags = []
+                start = 0
+                print("  [filter] quality сброшен.")
+                continue
+            parts = [p.strip() for p in arg.replace(",", " ").split() if p.strip()]
+            tags: list[str] = []
+            for p in parts:
+                t = QUALITY_TAGS.get(p)
+                if not t:
+                    print(f"  q: незнакомое значение «{p}». "
+                          f"Допустимо: {', '.join(sorted(QUALITY_TAGS))}.")
+                    tags = []
+                    break
+                if t not in tags:
+                    tags.append(t)
+            if tags:
+                quality_tags = tags
+                start = 0
+                print(f"  [filter] quality = {tags}")
+        elif cmd.startswith("ext"):
+            arg = cmd[3:].strip()
+            if arg in ("off", "reset", "", "none"):
+                exterior_tags = []
+                start = 0
+                print("  [filter] exterior сброшен.")
+                continue
+            parts = [p.strip() for p in arg.replace(",", " ").split() if p.strip()]
+            tags = []
+            for p in parts:
+                t = EXTERIOR_TAGS.get(p)
+                if not t:
+                    print(f"  ext: незнакомое значение «{p}». "
+                          f"Допустимо: {', '.join(EXTERIOR_TAGS)}.")
+                    tags = []
+                    break
+                if t not in tags:
+                    tags.append(t)
+            if tags:
+                exterior_tags = tags
+                start = 0
+                print(f"  [filter] exterior = {tags}")
+        elif cmd in ("q", "quit"):
+            return
         else:
             print(f"  (не понял «{cmd}» — введи 'h' для справки)")

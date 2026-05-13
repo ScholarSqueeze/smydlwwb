@@ -5450,6 +5450,90 @@ async def _bulk_sell_cross_account(  # noqa: PLR0912, PLR0915, C901
     filtered.sort(key=_sort_key)
     to_list = filtered[:n_target]
 
+    # 3.5) Проверка на брелки и редкие паттерны — та же, что в одиночном sell-
+    #      flow (см. место с `patterns.is_charm` и `patterns.is_rare_pattern`).
+    #      Раньше тут проверки не было — массовые выставления могли уехать в
+    #      Steam с редким паттерном без предупреждения. Теперь делим to_list на
+    #      «безопасные», «точно редкие» и «uncertain» (база содержит этот скин,
+    #      но конкретных номеров seed нет) — и просим юзера решить.
+    import patterns  # noqa: PLC0415  (локальный импорт — стиль файла)
+
+    if patterns.is_charm(name):
+        # У брелков seed «летает», централизованной таблицы тиров нет, поэтому
+        # такие предметы в массовом выставлении исторически блокируются.
+        print(
+            f"   ⚠  «{name}» — это брелок. У всех брелоков есть редкие паттерны,\n"
+            f"      и базы тиров нет. Выставляй вручную через `e <N>` → `s <N>`."
+        )
+        if not await _ask_yes_no("   Всё равно выставить массово?"):
+            print("   Отменено.")
+            return
+
+    rare_items: list[tuple[dict, str]] = []     # (candidate, tier)
+    uncertain_items: list[dict] = []
+    for c in to_list:
+        seed = c.get("paint_seed")
+        if seed is None:
+            # Не CS2 / brelock — skip pattern-check.
+            continue
+        res = patterns.is_rare_pattern(name, int(seed))
+        if res.is_rare is True:
+            rare_items.append((c, res.tier_note or "?"))
+        elif res.is_rare is None:
+            uncertain_items.append(c)
+
+    if rare_items or uncertain_items:
+        print("\n   ⚠  В выбранной партии найдены предметы с редкими паттернами:")
+        if rare_items:
+            print(f"   {len(rare_items)} точно редких (есть в 7patterns.json):")
+            for c, tier in rare_items:
+                who = _acc_display(c["username"], label_lookup)
+                pw = c.get("paint_wear")
+                pw_str = f"float={float(pw):.4f}" if pw is not None else "float=?"
+                print(
+                    f"     • seed={c.get('paint_seed')} ({tier}), {pw_str}, "
+                    f"acc={who}, asset_id={c.get('asset_id', '?')}"
+                )
+        if uncertain_items:
+            print(
+                f"   {len(uncertain_items)} «возможно редкий» "
+                f"(база `data/7patterns.txt` знает о редких паттернах\n"
+                f"     у этого скина, но точные номера в `7patterns.json` "
+                f"не вписаны — на всякий случай ставим вопрос):"
+            )
+            for c in uncertain_items:
+                who = _acc_display(c["username"], label_lookup)
+                pw = c.get("paint_wear")
+                pw_str = f"float={float(pw):.4f}" if pw is not None else "float=?"
+                print(
+                    f"     • seed={c.get('paint_seed')}, {pw_str}, "
+                    f"acc={who}, asset_id={c.get('asset_id', '?')}"
+                )
+        print(
+            "\n   Варианты:\n"
+            "     y      — выставлять ВСЁ (включая редкие/uncertain) по общей цене\n"
+            "     skip   — пропустить редкие/uncertain, выставить только безопасные\n"
+            "     n      — отменить всю операцию"
+        )
+        raw_p = (await _ask("   Выбор [y/skip/n]: ")).strip().lower()
+        if raw_p in ("n", "no", "q", ""):
+            print("   Отменено.")
+            return
+        if raw_p in ("skip", "s"):
+            risky_ids = {id(c) for c, _ in rare_items} | {id(c) for c in uncertain_items}
+            to_list = [c for c in to_list if id(c) not in risky_ids]
+            n_skipped = len(rare_items) + len(uncertain_items)
+            print(f"   [skip] пропущено {n_skipped} предметов с редкими/uncertain паттернами.")
+            if not to_list:
+                print("   После пропуска ничего не осталось. Отмена.")
+                return
+            n_target = len(to_list)
+        elif raw_p in ("y", "yes"):
+            print("   [!] Выставляем ВСЁ, включая редкие. Ответственность на тебе.")
+        else:
+            print(f"   Не понял «{raw_p}», отменяю.")
+            return
+
     # 4) Группируем по валюте аккаунта. Если валюты разные — будет отдельный
     #    промпт цены по каждой валюте (без этого Steam поставил бы «1.99 RUB» и «1.99 USD»
     #    как несопоставимые цены — «выставит очень неправильно»).

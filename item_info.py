@@ -37,6 +37,55 @@ import aiohttp
 _NAMEID_RE = re.compile(r"Market_LoadOrderSpread\(\s*(\d+)\s*\)")
 _GID_RE = re.compile(r"/market/listings/\d+/(G[0-9A-Fa-f]+)")
 
+# Локальная база `market_hash_name -> item_nameid`. Steam с обновлением 2026 г.
+# убрал `Market_LoadOrderSpread(...)` из публичного HTML листингов — теперь
+# nameid из страницы вытащить нельзя. Поэтому держим оффлайн-словарь под рукой
+# (`data/cs2_item_id_steam.json`). Файл опциональный: если его нет, просто
+# работаем как раньше через cache → HTML.
+import pathlib  # noqa: E402  (локальный импорт, чтобы не зашумлять top-level)
+
+_NAMEID_JSON_PATH = pathlib.Path(__file__).parent / "data" / "cs2_item_id_steam.json"
+_NAMEID_JSON_CACHE: dict[str, int] | None = None
+_NAMEID_JSON_MTIME: float | None = None
+
+
+def _load_nameid_json() -> dict[str, int]:
+    """Лениво загружает `data/cs2_item_id_steam.json` с авто-перезагрузкой.
+
+    Формат файла: плоский dict `market_hash_name → item_nameid`. Файл может
+    отсутствовать — тогда возвращаем пустой словарь.
+    """
+    global _NAMEID_JSON_CACHE, _NAMEID_JSON_MTIME
+
+    try:
+        mtime = _NAMEID_JSON_PATH.stat().st_mtime
+    except FileNotFoundError:
+        _NAMEID_JSON_CACHE = {}
+        _NAMEID_JSON_MTIME = None
+        return _NAMEID_JSON_CACHE
+
+    if _NAMEID_JSON_CACHE is not None and _NAMEID_JSON_MTIME == mtime:
+        return _NAMEID_JSON_CACHE
+
+    try:
+        raw = json.loads(_NAMEID_JSON_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        _NAMEID_JSON_CACHE = {}
+        _NAMEID_JSON_MTIME = mtime
+        return _NAMEID_JSON_CACHE
+
+    out: dict[str, int] = {}
+    if isinstance(raw, dict):
+        for name, nid in raw.items():
+            if isinstance(name, str) and isinstance(nid, (int, str)):
+                try:
+                    out[name] = int(nid)
+                except (TypeError, ValueError):
+                    continue
+    _NAMEID_JSON_CACHE = out
+    _NAMEID_JSON_MTIME = mtime
+    return _NAMEID_JSON_CACHE
+
 
 async def _fetch_item_page(
     session: aiohttp.ClientSession, app_id: int, market_hash_name: str
@@ -66,10 +115,16 @@ async def resolve_item_nameid(
 ) -> int | None:
     """Возвращает item_nameid с использованием SQLite-кеша.
 
-    Идёт по порядку: 1) cache.sqlite3 → 2) Steam HTML → 3) None.
-    Если Steam HTML отдал id — пишем в кеш для следующих запусков. Параллельно
-    из этой же страницы вытаскиваем и GID (если его ещё нет в кеше) — экономим
-    один HTTP-запрос.
+    Идёт по порядку:
+      1) cache.sqlite3,
+      2) локальный JSON `data/cs2_item_id_steam.json`
+         (после SSR-редизайна 2026 — основной источник),
+      3) Steam HTML (legacy путь — практически не срабатывает),
+      4) None.
+
+    Если HTML отдал id — пишем в кеш. JSON-попадание тоже кешируется в SQLite,
+    чтобы дальше не дёргать диск. Параллельно из HTML вытаскиваем GID (если его
+    ещё нет в кеше) — экономим один HTTP-запрос.
     """
     try:
         import cache
@@ -81,6 +136,20 @@ async def resolve_item_nameid(
         # Кеш — не критично, продолжаем с сетью.
         pass
 
+    # Шаг 2: локальный JSON (data/cs2_item_id_steam.json).
+    json_db = _load_nameid_json()
+    nameid = json_db.get(market_hash_name)
+    if nameid is not None:
+        try:
+            import cache
+
+            cache.cache_nameid(app_id, market_hash_name, nameid)
+        except Exception:  # noqa: BLE001
+            pass
+        return nameid
+
+    # Шаг 3: HTML (Steam с 2026 г. убрал nameid из публичного HTML, но оставим
+    # на случай если положат обратно или это другой app_id с legacy-страницей).
     page = await _fetch_item_page(client.session, app_id, market_hash_name)
     if page is None:
         return None
@@ -944,8 +1013,10 @@ async def show_item_info_menu(  # noqa: PLR0912, PLR0915, C901
         # cache.sqlite3 для этого предмета ничего не лежит, мы сюда и попадаем.
         # Не прерываемся — показываем то, что доступно: график цен и листинги.
         print(
-            "   [!] item_nameid недоступен (Steam перешёл на новый SSR-дизайн "
-            "листингов и больше не отдаёт его в HTML).\n"
+            "   [!] item_nameid недоступен.\n"
+            "       Не нашёл его ни в cache.sqlite3, ни в "
+            "data/cs2_item_id_steam.json, ни в HTML Steam'а (после SSR-редизайна\n"
+            "       Steam убрал nameid из публичных страниц).\n"
             "       Топ buy/sell-стакан в этой версии не покажу — "
             "но история цен и листинги ('f') работают."
         )

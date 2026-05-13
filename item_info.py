@@ -641,6 +641,51 @@ QUALITY_TAGS = {
     "sv": "tag_tournament",
 }
 
+# Маппинг человеческого имени экстерьера (как пишется в Steam в скобках, англ.) →
+# тэг фильтра. Используется для автодетекта экстерьера из market_hash_name.
+_EXTERIOR_BY_SUFFIX: dict[str, str] = {
+    "Factory New":    "tag_WearCategory0",
+    "Minimal Wear":   "tag_WearCategory1",
+    "Field-Tested":   "tag_WearCategory2",
+    "Well-Worn":      "tag_WearCategory3",
+    "Battle-Scarred": "tag_WearCategory4",
+}
+
+
+def _default_filters_from_name(
+    market_hash_name: str,
+) -> tuple[list[str], list[str]]:
+    """По имени предмета подбирает разумные фильтры по умолчанию.
+
+    Возвращает (quality_tags, exterior_tags). Логика:
+    - StatTrak™ <name> → quality = StatTrak™ (`tag_strange`).
+    - Souvenir <name>  → quality = Souvenir (`tag_tournament`).
+    - Иначе → quality = Normal (`tag_normal`).
+    - Если в скобках указан экстерьер (Field-Tested и т.п.) — добавляем
+      соответствующий exterior-тэг.
+
+    Если экстерьера в имени нет (контейнеры, наклейки, кейсы и пр.) — список
+    exterior_tags пустой, и фильтр по экстерьеру не накладывается.
+    """
+    name = market_hash_name.strip()
+
+    if name.startswith("StatTrak\u2122 ") or name.startswith("StatTrak "):
+        quality_tags = ["tag_strange"]
+    elif name.startswith("Souvenir "):
+        quality_tags = ["tag_tournament"]
+    else:
+        quality_tags = ["tag_normal"]
+
+    exterior_tags: list[str] = []
+    m = re.search(r"\(([^()]+)\)\s*$", name)
+    if m:
+        suffix = m.group(1).strip()
+        tag = _EXTERIOR_BY_SUFFIX.get(suffix)
+        if tag:
+            exterior_tags = [tag]
+
+    return quality_tags, exterior_tags
+
 
 async def _fetch_listings_page(  # noqa: PLR0913
     session: aiohttp.ClientSession,
@@ -649,7 +694,7 @@ async def _fetch_listings_page(  # noqa: PLR0913
     *,
     start: int,
     sort_field: int = 0,
-    sort_dir: int = 1,
+    sort_dir: int = 0,
     category_filters: dict[str, list[str]] | None = None,
     wear_range: tuple[float, float] | None = None,
     seed_range: tuple[int, int] | None = None,
@@ -664,7 +709,8 @@ async def _fetch_listings_page(  # noqa: PLR0913
 
     Параметры
     ---------
-    sort_field=0, sort_dir=0|1 — сортировка по цене (других режимов нет).
+    sort_field=0 — сортировка по цене (единственный режим, который умеет Steam).
+    sort_dir=0|1 — направление: 0 = по возрастанию (дефолт), 1 = по убыванию.
     category_filters — {"category_730_Quality": ["tag_normal"], …}.
         Ключи: category_730_{Exterior,Quality,Type,Rarity,Weapon,
         Tournament,TournamentTeam,ProPlayer,ItemSet,Sticker,Charm}.
@@ -805,6 +851,7 @@ def render_listings_page(
     sym: str,
     start_idx: int,
     total: int,
+    market_hash_name: str | None = None,
     floats: dict[str, tuple[float | None, int | None]] | None = None,  # noqa: ARG001
 ) -> list[str]:
     """Рисует страницу листингов.
@@ -812,7 +859,28 @@ def render_listings_page(
     Float/seed теперь приходят прямо в листинге из Steam Market v2 — рисуем
     их всегда (если у предмета их нет, печатаем «—»). Параметр `floats`
     оставлен для обратной совместимости вызывающего кода, но игнорируется.
+
+    Если задан `market_hash_name` — каждая строка с paint_seed проверяется через
+    `patterns.is_rare_pattern`; редкие листинги помечаются «★» в первой колонке
+    и перечисляются ниже отдельным блоком с указанием тира.
     """
+    # Импорт здесь, а не на верхнем уровне, чтобы избежать циклической зависимости
+    # и чтобы модуль `patterns` оставался опциональным (если файла нет — рендер
+    # листингов всё равно работает).
+    rare_marks: dict[int, tuple[str, int]] = {}
+    if market_hash_name:
+        try:
+            import patterns  # type: ignore[import-not-found]
+
+            for idx, item in enumerate(listings):
+                sd = item.get("paint_seed")
+                if isinstance(sd, int):
+                    res = patterns.is_rare_pattern(market_hash_name, sd)
+                    if res.is_rare is True:
+                        rare_marks[idx] = (res.tier_note or "?", sd)
+        except Exception:  # noqa: BLE001
+            rare_marks = {}
+
     lines = []
     lines.append("=" * 88)
     lines.append(
@@ -820,21 +888,28 @@ def render_listings_page(
     )
     lines.append("=" * 88)
     lines.append(
-        f"   {'#':<4}{'Цена':<14}{'Float':<10}{'Seed':<7}"
+        f"     {'#':<4}{'Цена':<14}{'Float':<10}{'Seed':<7}"
         f"{'listing_id':<22}asset_id"
     )
     lines.append("-" * 88)
     for i, item in enumerate(listings, start_idx + 1):
+        idx_zero = i - start_idx - 1
         price_str = f"{item['price_cents'] / 100:.2f} {sym}"
         fl = item.get("float")
         sd = item.get("paint_seed")
         fl_str = f"{fl:.4f}" if isinstance(fl, (int, float)) else "—"
         sd_str = str(sd) if isinstance(sd, int) else "—"
+        marker = "★" if idx_zero in rare_marks else " "
         lines.append(
-            f"   {i:<4}{price_str:<14}{fl_str:<10}{sd_str:<7}"
+            f"   {marker} {i:<4}{price_str:<14}{fl_str:<10}{sd_str:<7}"
             f"{item['listing_id']:<22}{item['asset_id']}"
         )
     lines.append("-" * 88)
+    if rare_marks:
+        lines.append("   ★ — редкий паттерн:")
+        for idx, (tier, sd) in sorted(rare_marks.items()):
+            row_num = start_idx + idx + 1
+            lines.append(f"       #{row_num}: seed={sd} ({tier})")
     return lines
 
 
@@ -860,21 +935,28 @@ async def show_item_info_menu(  # noqa: PLR0912, PLR0915, C901
     print("[..] Резолвлю item_nameid (из кеша или со страницы Steam) ...")
     app_id = int(app)
     nameid = await resolve_item_nameid(client, app_id, market_hash_name)
+    histogram = None
     if nameid is None:
+        # Steam c обновлением 2026 г. удалил `Market_LoadOrderSpread(...)` (и любую
+        # другую упоминалку item_nameid) из публичного HTML листингов — теперь
+        # клиент рендерит histogram через дополнительный auth-запрос, и без
+        # авторизованного nameid публично получить топ buy/sell нельзя. Если в
+        # cache.sqlite3 для этого предмета ничего не лежит, мы сюда и попадаем.
+        # Не прерываемся — показываем то, что доступно: график цен и листинги.
         print(
-            "   [!] Не смог вытащить item_nameid из Steam-страницы. "
-            "Возможные причины: предмет убрали с маркета, "
-            "либо Steam поменял HTML-структуру."
+            "   [!] item_nameid недоступен (Steam перешёл на новый SSR-дизайн "
+            "листингов и больше не отдаёт его в HTML).\n"
+            "       Топ buy/sell-стакан в этой версии не покажу — "
+            "но история цен и листинги ('f') работают."
         )
-        return
-
-    print(f"   item_nameid = {nameid}.")
-    print("[..] Гружу histogram (топ buy/sell) ...")
-    try:
-        histogram, _ = await client.get_item_orders_histogram(nameid)
-    except Exception as exc:  # noqa: BLE001
-        print(f"   [!] Histogram не загружен: {type(exc).__name__}: {exc}")
-        histogram = None
+    else:
+        print(f"   item_nameid = {nameid}.")
+        print("[..] Гружу histogram (топ buy/sell) ...")
+        try:
+            histogram, _ = await client.get_item_orders_histogram(nameid)
+        except Exception as exc:  # noqa: BLE001
+            print(f"   [!] Histogram не загружен: {type(exc).__name__}: {exc}")
+            histogram = None
 
     print("[..] Гружу историю цен (rate-limited Steam'ом) ...")
     try:
@@ -895,11 +977,27 @@ async def show_item_info_menu(  # noqa: PLR0912, PLR0915, C901
         for line in render_histogram_block(histogram, currency_sym or "_"):
             print(line)
 
-    if not history:
-        print("\n(без истории цен графики и счётчики продаж пусты)")
-        return
-
     sym = currency_sym or ""
+
+    if not history:
+        # Истории нет — графики/счётчики продаж пустые, но листинги ('f')
+        # всё ещё работают: они тянутся напрямую через POST-эндпоинт, ему
+        # ни nameid, ни истории не нужно. Предлагаем мини-меню вместо выхода.
+        print("\n(без истории цен графики и счётчики продаж пусты)")
+        if ask is None:
+            return
+        while True:
+            cmd = (await ask(
+                "  команды: f=листинги с флоатами / Enter=выход: "
+            )).strip().lower()
+            if cmd == "":
+                return
+            if cmd.startswith("f"):
+                await _show_listings_with_floats(
+                    client, app_id, market_hash_name, currency_code, sym, ask,
+                )
+            else:
+                print(f"  (не понял «{cmd}»)")
 
     # Сводка продаж за день/неделю/месяц — печатается один раз перед графиком,
     # потому что цифры одинаковые для всех периодов (день/неделя/месяц считаются
@@ -927,7 +1025,7 @@ async def show_item_info_menu(  # noqa: PLR0912, PLR0915, C901
             await ask(
                 "  команды: 7=неделя / 30=месяц / a=всё / "
                 "t=таблица точек / s=полный sell-стакан / b=полный buy-стакан / "
-                "f [N]=листинги с флоатами (по умолчанию 10, max 100) / "
+                "f=листинги с флоатами / "
                 "Enter=выход: "
             )
         ).strip().lower()
@@ -973,14 +1071,9 @@ async def show_item_info_menu(  # noqa: PLR0912, PLR0915, C901
             await ask("  Enter — продолжить: ")
         elif cmd.startswith("f"):
             # Floats viewer — листинги с inspect-link'ами.
-            # `f` → 10 шт. (по умолчанию). `f 50` → 50 шт. на странице.
-            parts = cmd.split()
-            page_count = 10
-            if len(parts) >= 2 and parts[1].isdigit():
-                page_count = max(1, min(100, int(parts[1])))
+            # Размер страницы теперь зашит у Steam (20 шт.), параметр игнорируется.
             await _show_listings_with_floats(
                 client, app_id, market_hash_name, currency_code, sym, ask,
-                page_size=page_count,
             )
         else:
             print(f"  (не понял «{cmd}»)")
@@ -989,8 +1082,6 @@ async def show_item_info_menu(  # noqa: PLR0912, PLR0915, C901
 async def _show_listings_with_floats(  # noqa: PLR0912, PLR0915, C901
     client, app_id: int, market_hash_name: str, currency_code: int,
     sym: str, ask,
-    *,
-    page_size: int = LISTINGS_PAGE_SIZE,  # noqa: ARG001  (фиксированный размер)
 ) -> None:
     """Просмотр выставленных листингов: цена + float + paint_seed + inspect-URL.
 
@@ -1031,11 +1122,12 @@ async def _show_listings_with_floats(  # noqa: PLR0912, PLR0915, C901
     total = 0
     loaded_key: tuple | None = None  # ключ кеша = (start, фильтры)
 
-    # Состояние фильтров.
+    # Состояние фильтров. По умолчанию: Quality=Normal + экстерьер из имени
+    # (например, имя «PP-Bizon | RMX (Field-Tested)» → ext=Field-Tested).
+    # Пользователь может всё это снять через `clear` / `q off` / `ext off`.
     wear_range: tuple[float, float] | None = None
     seed_range: tuple[int, int] | None = None
-    quality_tags: list[str] = []
-    exterior_tags: list[str] = []
+    quality_tags, exterior_tags = _default_filters_from_name(market_hash_name)
 
     def _category_filters() -> dict[str, list[str]]:
         f: dict[str, list[str]] = {}
@@ -1116,6 +1208,7 @@ async def _show_listings_with_floats(  # noqa: PLR0912, PLR0915, C901
         else:
             for line in render_listings_page(
                 page_listings, sym=sym, start_idx=start, total=total,
+                market_hash_name=market_hash_name,
             ):
                 print(line)
 

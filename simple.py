@@ -870,6 +870,121 @@ def _make_item_info_callback(client, currency_enum, currency_code: int, item_or_
     return _cb
 
 
+async def _auto_suggest_price(
+    client, currency_enum, currency_code: int,
+    *, name: str, paint_seed: int | None, paint_wear: float | None,
+) -> tuple[int, str, str] | None:
+    """Авто-подбор цены: Path A (коммодити) / B (с флоатом) / C (редкий).
+
+    Возвращает (cents, reason, "A"|"B"|"C") или None если данных не хватило.
+    """
+    from aiosteampy.constants import App
+
+    try:
+        import item_info as _ii
+        import price_suggest as _ps
+    except ImportError as exc:  # pragma: no cover
+        print(f"   [BUG] модуль не загружен: {exc}")
+        return None
+
+    # Скин определяем как CS2; для остальных app'ов авто-цена пока не считается
+    # (нет смысла — Path A работает для cs2 коммодити, для прочих игр нужна
+    # отдельная валидация).
+    app = App.CS2
+    app_id = int(app.value)
+
+    path = _ps.classify(name, paint_seed)
+
+    if path == "C":
+        try:
+            import patterns
+
+            res = patterns.is_rare_pattern(name, int(paint_seed or 0))
+            tier = res.tier_note or "?"
+        except Exception:  # noqa: BLE001
+            tier = "?"
+        print(
+            f"   ⚠  Path C: «{name}» seed={paint_seed} — редкий паттерн ({tier}).\n"
+            f"   Автоматику для редких НЕ применяю — введи цену вручную."
+        )
+        return None
+
+    # Для Path A/B нам нужны daily_sales (всем) + sell_table (Path A) / GID (Path B).
+    history = None
+    try:
+        history = await client.fetch_price_history(name, app)
+    except Exception as exc:  # noqa: BLE001
+        print(f"   [!] price_history недоступна: {type(exc).__name__}: {exc}")
+
+    daily = _ps.daily_sales_from_history(history) if history else 0.0
+    week = _ps.week_pct_from_history(history) if history else None
+    if daily <= 0:
+        print("   [!] нет daily_sales (price_history пустая / закрыта).")
+        return None
+
+    if path == "B":
+        gid = await _ii.resolve_gid(client, app_id, name)
+        if not gid:
+            print("   [!] GID не получен — Path B не доступен.")
+            return None
+        quality_tags, exterior_tags = _ii._default_filters_from_name(name)  # noqa: SLF001
+        q_tag = quality_tags[0] if quality_tags else None
+        e_tag = exterior_tags[0] if exterior_tags else None
+        sug = await _ps.path_b_suggest(
+            client.session, app_id, gid,
+            our_float=float(paint_wear or 0.0),
+            quality_tag=q_tag,
+            exterior_tag=e_tag,
+            currency_code=currency_code,
+            daily_sales=daily,
+        )
+        if sug.cents is None:
+            return None
+        return (sug.cents, sug.reason, "B")
+
+    # Path A: используем histogram (sell_order_table).
+    nameid = await _ii.resolve_item_nameid(client, app_id, name)
+    if nameid is None:
+        print("   [!] item_nameid не получен — Path A без histogram не работает.")
+        return None
+    try:
+        histogram, _ = await client.get_item_orders_histogram(nameid)
+    except Exception as exc:  # noqa: BLE001
+        print(f"   [!] histogram недоступен: {type(exc).__name__}: {exc}")
+        return None
+
+    sell_table = []
+    for row in histogram.sell_order_table or ():
+        p = getattr(row, "price", None)
+        q = getattr(row, "quantity", None)
+        if p is not None and q is not None:
+            sell_table.append((int(p), int(q)))
+    if not sell_table:
+        print("   [!] sell_order_table пустой.")
+        return None
+    sug = _ps.path_a_suggest(sell_table, daily, week)
+    if sug.cents is None:
+        return None
+    return (sug.cents, sug.reason, "A")
+
+
+def _make_auto_price_callback(
+    client, currency_enum, currency_code: int, item,
+):
+    """async-callback для `_ask_price_cents.a_callback`."""
+    async def _cb():
+        name = _resolve_market_hash_name(item)
+        if not name:
+            print("   [!] нет market_hash_name — auto-price невозможна.")
+            return None
+        _wear, seed = _cs2_extract_wear_seed(item)
+        return await _auto_suggest_price(
+            client, currency_enum, currency_code,
+            name=name, paint_seed=seed, paint_wear=_wear,
+        )
+    return _cb
+
+
 def _item_info_action_factory(client, currency_enum, currency_code: int, sym: str):
     """Возвращает async-хендлер для команды `i <N>` — показать info по предмету.
 
@@ -1792,7 +1907,9 @@ def _print_inventory_item(
             print(f"          🔗 чарм: {c_name}  (pattern={c_pattern})")
 
 
-async def _ask_price_cents(prompt: str, *, i_callback=None) -> int | None:
+async def _ask_price_cents(
+    prompt: str, *, i_callback=None, a_callback=None,
+) -> int | None:
     """Спросить цену типа `1.99`/`1,99` — вернёт центы (int) или None.
 
     None возвращается на пустой ввод и на «q» / «b» (back) — это
@@ -1801,6 +1918,11 @@ async def _ask_price_cents(prompt: str, *, i_callback=None) -> int | None:
     Если задан `i_callback` (async no-arg вызываемый объект) — на вводе `i`
     он вызывается (обычно открывает item-info / график цен), потом снова
     спрашивается цена. Без callback `i` обрабатывается как невалидный ввод.
+
+    Если задан `a_callback` (async no-arg → (cents:int, reason:str, path:str)
+    | None) — на вводе `a` он вызывается. Если вернул не-None — печатается
+    suggestion, и спрашиваем подтверждение: `y` принимает, число вводит своё,
+    `q` отменяет.
     """
     while True:
         raw = (await _ask(prompt)).strip().replace(",", ".")
@@ -1812,6 +1934,34 @@ async def _ask_price_cents(prompt: str, *, i_callback=None) -> int | None:
             except Exception as exc:  # noqa: BLE001
                 print(f"   [!] item-info упал: {exc!r}")
             continue
+        if raw.lower() == "a" and a_callback is not None:
+            try:
+                sug = await a_callback()
+            except Exception as exc:  # noqa: BLE001
+                print(f"   [!] auto-price упал: {exc!r}")
+                continue
+            if sug is None:
+                print("   [!] авто-цена не смогла подобрать — введи цену вручную.")
+                continue
+            cents_a, reason, path = sug
+            print(f"   ► Авто-цена (Path {path}): {cents_a / 100:.2f}  ({reason})")
+            confirm = (await _ask(
+                "   [y=принять / число=ввести своё / q=отмена]: "
+            )).strip().lower().replace(",", ".")
+            if confirm in ("y", "yes", ""):
+                return cents_a
+            if confirm in ("q", "b"):
+                return None
+            try:
+                amount = float(confirm)
+            except ValueError:
+                print(f"   «{confirm}» не похоже на число — попробуй заново.")
+                continue
+            cents = int(round(amount * 100))
+            if cents <= 0:
+                print("   Цена должна быть > 0.")
+                continue
+            return cents
         try:
             amount = float(raw)
         except ValueError:
@@ -1905,11 +2055,13 @@ async def _list_item_action(
 
         print(f"   Выставить «{name}» (asset_id={item.asset_id}) на продажу.")
         info_cb = _make_item_info_callback(client, currency_enum, currency_code, item)
+        auto_cb = _make_auto_price_callback(client, currency_enum, currency_code, item)
         cents = await _ask_price_cents(
             "   Цена для покупателя в "
             + ("долларах" if currency_code == 1 else "валюте кошелька")
-            + " (1.99, i=инфо/график, q/b/Enter — назад): ",
+            + " (1.99, i=инфо/график, a=авто-цена, q/b/Enter — назад): ",
             i_callback=info_cb,
+            a_callback=auto_cb,
         )
         if cents is None:
             print("   Отменено.")
@@ -2221,6 +2373,9 @@ async def _bulk_list_group(
     info_cb = _make_item_info_callback(
         client, currency_enum, currency_code, marketable[0],
     )
+    auto_cb = _make_auto_price_callback(
+        client, currency_enum, currency_code, marketable[0],
+    )
     total_marketable = len(marketable)
     while True:
         raw_n = (await _ask(
@@ -2277,12 +2432,13 @@ async def _bulk_list_group(
             except ValueError:
                 print(f"   «{raw}» не похоже на float — игнорирую.")
 
-    # 3) Цена. С i=info колбэком.
+    # 3) Цена. С i=info колбэком и a=auto-price.
     cents = await _ask_price_cents(
         "   Цена для покупателя в "
         + ("долларах" if currency_code == 1 else "валюте кошелька")
-        + " (например 1.99, i=инфо/график, q/b/Enter — назад): ",
+        + " (например 1.99, i=инфо/график, a=авто-цена, q/b/Enter — назад): ",
         i_callback=info_cb,
+        a_callback=auto_cb,
     )
     if cents is None:
         print("   Отменено, возвращаемся в инвентарь.")
@@ -5284,6 +5440,224 @@ def _account_currency_code(
     return None
 
 
+async def _auto_price_group(  # noqa: PLR0912, PLR0915, C901
+    client,
+    currency_enum,
+    currency_code: int,
+    *,
+    name: str,
+    group: list[dict],
+    label_lookup: dict[str, str],
+    cur_sym: str,
+) -> tuple[str, "int | dict[str, int]"] | None:
+    """Авто-цена для группы candidates одной валюты в cross-account bulk-list.
+
+    Возвращает:
+      • ("uniform", cents)    — одна общая цена (Path A, без флоата);
+      • ("per_item", {asset_id_str: cents, ...}) — индивидуальная (Path B);
+      • ("skip", None)        — юзер выбрал «пропустить эту валюту»;
+      • None                  — юзер отменил подбор, вернуть в основной промпт.
+    """
+    from aiosteampy.constants import App
+
+    try:
+        import item_info as _ii
+        import price_suggest as _ps
+    except ImportError as exc:  # pragma: no cover
+        print(f"   [BUG] модуль не загружен: {exc}")
+        return None
+
+    print(f"\n   [auto-price] анализирую «{name}» для группы из {len(group)} экз. ...")
+
+    app = App.CS2
+    app_id = int(app.value)
+
+    # Определяем «общий» путь группы: если ни у кого нет paint_seed → Path A.
+    # Иначе классифицируем КАЖДЫЙ кандидат отдельно (поскольку seed/float у них разные).
+    has_seed = any(c.get("paint_seed") is not None for c in group)
+
+    # Базовые метрики (общие для всей группы).
+    history = None
+    try:
+        history = await client.fetch_price_history(name, app)
+    except Exception as exc:  # noqa: BLE001
+        print(f"   [!] price_history недоступна: {type(exc).__name__}: {exc}")
+    daily = _ps.daily_sales_from_history(history) if history else 0.0
+    week = _ps.week_pct_from_history(history) if history else None
+    if daily <= 0:
+        print(
+            "   [!] daily_sales = 0 — Path A/B не считается. Вводи цену вручную."
+        )
+        return None
+
+    week_str = f"{week:+.1f}%" if week is not None else "?"
+    print(f"   daily_sales≈{daily:.0f}/день, week={week_str}.")
+
+    if not has_seed:
+        # Path A — одна цена для всей группы.
+        nameid = await _ii.resolve_item_nameid(client, app_id, name)
+        if nameid is None:
+            print("   [!] item_nameid не получен — Path A без histogram не работает.")
+            return None
+        try:
+            histogram, _ = await client.get_item_orders_histogram(nameid)
+        except Exception as exc:  # noqa: BLE001
+            print(f"   [!] histogram недоступен: {type(exc).__name__}: {exc}")
+            return None
+        sell_table: list[tuple[int, int]] = []
+        for row in histogram.sell_order_table or ():
+            p = getattr(row, "price", None)
+            q = getattr(row, "quantity", None)
+            if p is not None and q is not None:
+                sell_table.append((int(p), int(q)))
+        if not sell_table:
+            print("   [!] sell_order_table пустой.")
+            return None
+        sug = _ps.path_a_suggest(sell_table, daily, week)
+        if sug.cents is None:
+            print("   [!] Path A: суггест не вышел.")
+            return None
+        print(
+            f"\n   ► Path A (коммодити, всем {len(group)} экз.): "
+            f"{sug.cents/100:.2f} {cur_sym}"
+        )
+        print(f"   reason: {sug.reason}")
+        ans = (await _ask(
+            "   [y=принять / число=своя цена / skip=пропустить валюту / n=отмена]: "
+        )).strip().lower().replace(",", ".")
+        if ans in ("y", "yes", ""):
+            return ("uniform", int(sug.cents))
+        if ans in ("skip", "s"):
+            return ("skip", None)
+        if ans in ("n", "no", "q", "b"):
+            return None
+        try:
+            cents = int(round(float(ans) * 100))
+            if cents > 0:
+                return ("uniform", cents)
+        except ValueError:
+            pass
+        print(f"   Не понял «{ans}», отменяю авто-подбор.")
+        return None
+
+    # Path B/C — нужны индивидуальные цены.
+    # Резолвим GID и теги один раз — название одинаковое у всей группы.
+    gid = await _ii.resolve_gid(client, app_id, name)
+    if not gid:
+        print("   [!] GID не получен — Path B недоступен.")
+        return None
+    quality_tags, exterior_tags = _ii._default_filters_from_name(name)  # noqa: SLF001
+    q_tag = quality_tags[0] if quality_tags else None
+    e_tag = exterior_tags[0] if exterior_tags else None
+
+    # Считаем суггест для каждого кандидата.
+    suggestions: list[dict] = []  # {row, path, cents, reason}
+    print()
+    print(
+        f"   {'#':<3} {'acc':<14} {'float':>7} {'seed':>5} "
+        f"{'suggest':>10} path  reason"
+    )
+    print("   " + "-" * 90)
+    for idx, c in enumerate(group, 1):
+        seed = c.get("paint_seed")
+        pw = c.get("paint_wear")
+        who = _acc_display(c["username"], label_lookup)
+        path = _ps.classify(name, seed)
+        cents: int | None = None
+        reason = ""
+        if path == "C":
+            try:
+                import patterns
+                tier = patterns.is_rare_pattern(name, int(seed or 0)).tier_note or "?"
+            except Exception:  # noqa: BLE001
+                tier = "?"
+            reason = f"редкий ({tier}) — ручной ввод"
+        elif path == "B":
+            sug_b = await _ps.path_b_suggest(
+                client.session, app_id, gid,
+                our_float=float(pw or 0.0),
+                quality_tag=q_tag,
+                exterior_tag=e_tag,
+                currency_code=currency_code,
+                daily_sales=daily,
+            )
+            cents = sug_b.cents
+            reason = sug_b.reason
+        else:  # path == "A" — у seed нет, попадание сюда маловероятно но всё же
+            # fallback к Path A (histogram). Использовать уже полученную таблицу,
+            # если есть; если нет — пропустить.
+            reason = "no seed → A (но группа с seed; пропускаю)"
+
+        suggestions.append({
+            "row": c, "path": path, "cents": cents, "reason": reason,
+            "skip": path == "C" or cents is None,
+        })
+        cents_str = f"{cents/100:.2f}" if cents is not None else "—"
+        fl_str = f"{float(pw):.4f}" if pw is not None else "—"
+        seed_str = str(seed) if seed is not None else "—"
+        print(
+            f"   {idx:<3} {who[:14]:<14} {fl_str:>7} {seed_str:>5} "
+            f"{cents_str:>10}  {path}    {reason}"
+        )
+
+    while True:
+        print(
+            "\n   [y=выставить, edit <N> <price>=поправить, skip <N>=исключить, "
+            "n=отменить]: ",
+            end="",
+        )
+        ans = (await _ask("")).strip()
+        if not ans or ans.lower() in ("n", "no", "q", "b"):
+            return None
+        if ans.lower() in ("y", "yes"):
+            # Фильтруем skip-помеченные.
+            per_item: dict[str, int] = {}
+            for s in suggestions:
+                if s["skip"] or s["cents"] is None:
+                    continue
+                per_item[str(s["row"]["asset_id"])] = int(s["cents"])
+            if not per_item:
+                print("   [!] ни одной валидной цены — нечего выставлять.")
+                return None
+            n_skipped = sum(1 for s in suggestions if s["skip"])
+            if n_skipped:
+                print(f"   [info] {n_skipped} экз. пропущено (Path C / нет цены).")
+            return ("per_item", per_item)
+        # edit <N> <price>
+        parts = ans.split()
+        if len(parts) == 3 and parts[0].lower() == "edit":
+            try:
+                n = int(parts[1])
+                new_cents = int(round(float(parts[2].replace(",", ".")) * 100))
+            except ValueError:
+                print("   [!] формат: edit <N> <price>, например `edit 3 5.21`.")
+                continue
+            if not 1 <= n <= len(suggestions):
+                print(f"   [!] N должен быть 1..{len(suggestions)}.")
+                continue
+            if new_cents <= 0:
+                print("   [!] цена должна быть > 0.")
+                continue
+            suggestions[n - 1]["cents"] = new_cents
+            suggestions[n - 1]["skip"] = False
+            suggestions[n - 1]["reason"] = "(ручная правка)"
+            print(f"   [ok] {n}: {new_cents/100:.2f} {cur_sym}")
+            continue
+        if len(parts) == 2 and parts[0].lower() == "skip":
+            try:
+                n = int(parts[1])
+            except ValueError:
+                print("   [!] формат: skip <N>.")
+                continue
+            if not 1 <= n <= len(suggestions):
+                print(f"   [!] N должен быть 1..{len(suggestions)}.")
+                continue
+            suggestions[n - 1]["skip"] = True
+            print(f"   [ok] #{n} пропущен.")
+            continue
+        print(f"   [!] не понял «{ans}». Команды: y / edit N PRICE / skip N / n.")
+
+
 async def _bulk_sell_cross_account(  # noqa: PLR0912, PLR0915, C901
     *,
     name: str,
@@ -5578,11 +5952,17 @@ async def _bulk_sell_cross_account(  # noqa: PLR0912, PLR0915, C901
         if multi_currency:
             print(f"\n   ——— Валюта: {cur_sym or '?'} (code={cur_code or '?'}) ———")
 
+        # per_item_prices: если юзер выбрал авто-цену в режиме Path B, каждому
+        # asset_id своя цена. При None — используем общую `price_cents`.
+        per_item_prices: dict[str, int] | None = None
+
         # Промпт цены. 'i' — открывает item-info ИМЕННО в валюте группы.
+        # 'a' — авто-подбор для всей группы.
         while True:
             raw_price = (await _ask(
                 f"   Цена покупателя за штуку в {cur_sym or 'валюте акков этой группы'} "
-                f"(например 1.99; i=инфо/график в {cur_sym or 'валюте акка'}, q=пропустить эту валюту): "
+                f"(например 1.99; i=инфо/график, a=авто-цена, "
+                f"q=пропустить эту валюту): "
             )).strip().lower().replace(",", ".")
             if raw_price in ("q", "b"):
                 if not multi_currency:
@@ -5600,6 +5980,44 @@ async def _bulk_sell_cross_account(  # noqa: PLR0912, PLR0915, C901
                 break
             if raw_price == "i":
                 await _open_item_info(any_username_for_currency)
+                continue
+            if raw_price == "a":
+                # Берём сессию клиента группы — там есть нужная валюта.
+                if any_username_for_currency in sessions:
+                    auto_client = sessions[any_username_for_currency][0]
+                else:
+                    acc = accounts_lookup.get(any_username_for_currency)
+                    auto_client = None
+                    if acc is not None:
+                        connected = await _connect_account(acc, force_relogin)
+                        if connected is not None:
+                            sessions[any_username_for_currency] = connected
+                            auto_client = connected[0]
+                if auto_client is None:
+                    print("   [!] auto-price: не смог получить клиента группы.")
+                    continue
+                outcome = await _auto_price_group(
+                    auto_client, Currency, cur_code or 0,
+                    name=name, group=group, label_lookup=label_lookup,
+                    cur_sym=cur_sym,
+                )
+                if outcome is None:
+                    # Юзер отменил подбор — снова спрашиваем цену.
+                    continue
+                kind, payload = outcome
+                if kind == "skip":
+                    raw_price = ""
+                    break
+                if kind == "uniform":
+                    price_cents = payload
+                    raw_price = f"auto:{price_cents / 100:.2f}"
+                    break
+                if kind == "per_item":
+                    per_item_prices = payload
+                    price_cents = 0  # не используется, перебивается per_item
+                    raw_price = "auto:per_item"
+                    break
+                # Неизвестный исход — лупимся снова.
                 continue
             try:
                 amount = float(raw_price)
@@ -5625,8 +6043,20 @@ async def _bulk_sell_cross_account(  # noqa: PLR0912, PLR0915, C901
         summary_accs = ", ".join(
             f"{_acc_display(u, label_lookup)}×{q}" for u, q in by_acc.most_common()
         )
-        price_str = f"{price_cents / 100:.2f} {cur_sym}".strip()
-        print(f"\n   ВЫСТАВИТЬ ({cur_sym or 'val'}): {len(group)} экз. «{name}» по {price_str}")
+        if per_item_prices is None:
+            price_str = f"{price_cents / 100:.2f} {cur_sym}".strip()
+            print(
+                f"\n   ВЫСТАВИТЬ ({cur_sym or 'val'}): {len(group)} экз. "
+                f"«{name}» по {price_str}"
+            )
+        else:
+            min_p = min(per_item_prices.values())
+            max_p = max(per_item_prices.values())
+            print(
+                f"\n   ВЫСТАВИТЬ ({cur_sym or 'val'}): {len(group)} экз. "
+                f"«{name}» по индивидуальным ценам "
+                f"({min_p/100:.2f}…{max_p/100:.2f} {cur_sym})"
+            )
         print(f"   С аккаунтов: {summary_accs}")
         if not await _ask_yes_no("   Подтвердить эту валютную группу?"):
             print("   [SKIP] валюта пропущена, ничего не выставлено.")
@@ -5667,9 +6097,14 @@ async def _bulk_sell_cross_account(  # noqa: PLR0912, PLR0915, C901
             # Выставляем по одному.
             for i, item_row in enumerate(items_for_user, 1):
                 asset_id = int(item_row["asset_id"])
+                # Если у нас per_item_prices (авто-Path B) — берём ОТТУДА цену.
+                if per_item_prices is not None:
+                    this_price = per_item_prices.get(str(asset_id), price_cents)
+                else:
+                    this_price = price_cents
                 try:
                     listing_id = await _place_sell_listing_with_retry(
-                        client, asset_id, target_app_context, price=price_cents,
+                        client, asset_id, target_app_context, price=this_price,
                         what=f"place_sell_listing #{i} (asset={asset_id}, user={username})",
                     )
                     ok += 1
@@ -5683,7 +6118,7 @@ async def _bulk_sell_cross_account(  # noqa: PLR0912, PLR0915, C901
                                 listing_id,
                                 unowned_id=str(asset_id),
                                 market_hash_name=name,
-                                price_cents=int(price_cents),
+                                price_cents=int(this_price),
                                 currency_code=int(cur_code) if cur_code is not None else None,
                             )
                         except Exception as exc_cache:  # noqa: BLE001
